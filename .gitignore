@@ -1,0 +1,18 @@
+# Credenciais e variáveis de ambiente
+.env
+
+# Tokens dos devices (gerados pelo provision_devices.py)
+device_tokens*.json
+
+# Resultados de load test (gerados automaticamente)
+results/
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
