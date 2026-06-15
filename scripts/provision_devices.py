@@ -456,6 +456,19 @@ async def create_device(
     return device_id, token
 
 
+async def get_tenant_device_count(
+    client: httpx.AsyncClient, tenant_token: str
+) -> int:
+    """Quantos devices o tenant tem AGORA no ThingsBoard (fonte da verdade)."""
+    headers = {"X-Authorization": f"Bearer {tenant_token}"}
+    resp = await client.get(
+        f"{TB_BASE_URL}/api/tenant/devices?pageSize=1&page=0",
+        headers=headers, timeout=30,
+    )
+    resp.raise_for_status()
+    return int(resp.json().get("totalElements", 0))
+
+
 # ---------------------------------------------------------------------------
 # Provisionamento paralelo
 # ---------------------------------------------------------------------------
@@ -554,9 +567,32 @@ async def main(n_devices: int, concurrency: int) -> None:
         if TOKENS_PATH.exists():
             with open(TOKENS_PATH) as f:
                 existing = json.load(f)
-            console.print(
-                f"[yellow]{len(existing):,} devices já existem, pulando...[/yellow]"
-            )
+
+        # Valida o arquivo de tokens contra o TB real. Se ele lista mais devices
+        # do que existem no ThingsBoard (ex: o banco foi limpo), os tokens estão
+        # defasados — pular a criação deixaria o MQTT falhando com token inválido.
+        # Nesse caso, faz backup do arquivo e reprovisiona tudo do zero.
+        if existing:
+            listed = len(existing)
+            tb_count = await get_tenant_device_count(client, tenant_token)
+            if tb_count < listed:
+                backup = TOKENS_PATH.with_name(TOKENS_PATH.name + ".stale")
+                console.print(
+                    f"[bold red]Tokens defasados:[/bold red] o arquivo lista "
+                    f"{listed:,} devices, mas o ThingsBoard só tem {tb_count:,}. "
+                    f"O banco foi limpo? Ignorando tokens antigos e "
+                    f"reprovisionando do zero."
+                )
+                try:
+                    TOKENS_PATH.replace(backup)
+                    console.print(f"[yellow]Backup do arquivo antigo: {backup}[/yellow]")
+                except OSError:
+                    pass
+                existing = {}
+            else:
+                console.print(
+                    f"[yellow]{listed:,} devices já existem, pulando...[/yellow]"
+                )
 
         # Usa 6 dígitos para suportar até 999 999 devices
         names_to_create = [
