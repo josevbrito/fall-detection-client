@@ -114,51 +114,74 @@ TB_TENANT_PASSWORD = os.getenv("TB_TENANT_PASSWORD", "tenant2026")
 STATS_DEVICE_NAME = "load-test-stats"
 
 
+async def _tb_login_and_stats_device(c: httpx.AsyncClient) -> tuple:
+    """Loga como tenant admin e retorna (headers, device_id do load-test-stats),
+    criando o device de stats se ainda não existir."""
+    r = await c.post(
+        f"{TB_BASE_URL}/api/auth/login",
+        json={"username": TB_TENANT_EMAIL, "password": TB_TENANT_PASSWORD},
+    )
+    r.raise_for_status()
+    headers = {"X-Authorization": f"Bearer {r.json()['token']}"}
+
+    r = await c.get(
+        f"{TB_BASE_URL}/api/tenant/devices",
+        params={"pageSize": 10, "page": 0, "textSearch": STATS_DEVICE_NAME},
+        headers=headers,
+    )
+    r.raise_for_status()
+    device_id = next(
+        (d["id"]["id"] for d in r.json().get("data", [])
+         if d.get("name") == STATS_DEVICE_NAME),
+        None,
+    )
+    if device_id is None:
+        r = await c.post(
+            f"{TB_BASE_URL}/api/device",
+            json={"name": STATS_DEVICE_NAME, "type": "load-test"},
+            headers=headers,
+        )
+        r.raise_for_status()
+        device_id = r.json()["id"]["id"]
+    return headers, device_id
+
+
+async def _publish_payload(c, headers, device_id, report: dict) -> None:
+    payload = {k: v for k, v in report.items() if isinstance(v, (int, float))}
+    payload["node_id"] = report.get("node_id", "local")
+    r = await c.post(
+        f"{TB_BASE_URL}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/ANY",
+        json=payload,
+        headers=headers,
+    )
+    r.raise_for_status()
+
+
 async def publish_summary_to_tb(report: dict) -> None:
-    """Publica o resumo do experimento como telemetria no device load-test-stats.
-
-    Loga como tenant admin (direto), cria o device de stats se não existir e
-    envia as métricas (throughput, percentis, etc.) para o dashboard consumir.
-    """
+    """Publica um snapshot das métricas no device load-test-stats (one-shot)."""
     async with httpx.AsyncClient(timeout=20, verify=True) as c:
-        # Login direto como tenant admin (funciona em LAN e no ThingsBoard Cloud).
-        r = await c.post(
-            f"{TB_BASE_URL}/api/auth/login",
-            json={"username": TB_TENANT_EMAIL, "password": TB_TENANT_PASSWORD},
-        )
-        r.raise_for_status()
-        headers = {"X-Authorization": f"Bearer {r.json()['token']}"}
+        headers, device_id = await _tb_login_and_stats_device(c)
+        await _publish_payload(c, headers, device_id, report)
 
-        # Acha o device de stats; cria se não existir.
-        r = await c.get(
-            f"{TB_BASE_URL}/api/tenant/devices",
-            params={"pageSize": 10, "page": 0, "textSearch": STATS_DEVICE_NAME},
-            headers=headers,
-        )
-        r.raise_for_status()
-        device_id = next(
-            (d["id"]["id"] for d in r.json().get("data", [])
-             if d.get("name") == STATS_DEVICE_NAME),
-            None,
-        )
-        if device_id is None:
-            r = await c.post(
-                f"{TB_BASE_URL}/api/device",
-                json={"name": STATS_DEVICE_NAME, "type": "load-test"},
-                headers=headers,
-            )
-            r.raise_for_status()
-            device_id = r.json()["id"]["id"]
 
-        # Publica o resumo como telemetria (valores mais recentes).
-        payload = {k: v for k, v in report.items() if isinstance(v, (int, float))}
-        payload["node_id"] = report.get("node_id", "local")
-        r = await c.post(
-            f"{TB_BASE_URL}/api/plugins/telemetry/DEVICE/{device_id}/timeseries/ANY",
-            json=payload,
-            headers=headers,
-        )
-        r.raise_for_status()
+async def live_stats_loop(make_report, interval: float = 5.0) -> None:
+    """Publica o snapshot atual no TB a cada `interval` segundos durante o teste,
+    para o dashboard mostrar o Desempenho em tempo real (e acumular o histórico
+    dos últimos 30 min). Não-fatal: qualquer erro é engolido para não derrubar o
+    load test; o resumo final é publicado de qualquer forma ao terminar."""
+    try:
+        async with httpx.AsyncClient(timeout=20, verify=True) as c:
+            headers, device_id = await _tb_login_and_stats_device(c)
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await _publish_payload(c, headers, device_id, make_report())
+                except Exception:
+                    pass
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Métricas Prometheus
@@ -613,37 +636,45 @@ async def main(n_devices: int, n_requests: int, interval_ms: int, offset: int = 
         for name, token, idx in valid
     ]
 
+    def current_report() -> dict:
+        """Snapshot das métricas atuais — usado tanto no publish ao vivo
+        (a cada 5s) quanto no resumo final."""
+        m = METRICS
+        return {
+            "node_id": NODE_ID,
+            "device_offset": offset,
+            "total_devices": len(valid),
+            "requests_per_device": n_requests,
+            "interval_ms": interval_ms,
+            "mqtt_qos": MQTT_QOS,
+            "fall_mode": fall_mode,
+            "fall_probability": fall_prob,
+            "total_published": m.total_published,
+            "total_errors": m.total_errors,
+            "total_falls_simulated": m.total_falls,
+            "falls_per_device_avg": round(m.total_falls / max(len(valid), 1), 3),
+            "elapsed_seconds": round(m.elapsed_s, 2),
+            "throughput_msg_per_s": round(m.throughput, 2),
+            "avg_latency_ms": round(m.avg_latency_ms, 2),
+            "p50_latency_ms": round(m.percentile(0.50), 2),
+            "p70_latency_ms": round(m.percentile(0.70), 2),
+            "p95_latency_ms": round(m.percentile(0.95), 2),
+            "p99_latency_ms": round(m.p99_latency_ms, 2),
+            "error_rate_pct": round(
+                m.total_errors / max(m.total_published + m.total_errors, 1) * 100, 2
+            ),
+        }
+
     metrics_task = asyncio.create_task(metrics_loop())
+    # Publica métricas no TB a cada 5s para o dashboard ver o Desempenho ao vivo.
+    live_task = asyncio.create_task(live_stats_loop(current_report, interval=5.0))
 
     await asyncio.gather(*tasks)
     await asyncio.sleep(1)
     metrics_task.cancel()
+    live_task.cancel()
 
-    m = METRICS
-    report = {
-        "node_id": NODE_ID,
-        "device_offset": offset,
-        "total_devices": len(valid),
-        "requests_per_device": n_requests,
-        "interval_ms": interval_ms,
-        "mqtt_qos": MQTT_QOS,
-        "fall_mode": fall_mode,
-        "fall_probability": fall_prob,
-        "total_published": m.total_published,
-        "total_errors": m.total_errors,
-        "total_falls_simulated": m.total_falls,
-        "falls_per_device_avg": round(m.total_falls / max(len(valid), 1), 3),
-        "elapsed_seconds": round(m.elapsed_s, 2),
-        "throughput_msg_per_s": round(m.throughput, 2),
-        "avg_latency_ms": round(m.avg_latency_ms, 2),
-        "p50_latency_ms": round(m.percentile(0.50), 2),
-        "p70_latency_ms": round(m.percentile(0.70), 2),
-        "p95_latency_ms": round(m.percentile(0.95), 2),
-        "p99_latency_ms": round(m.p99_latency_ms, 2),
-        "error_rate_pct": round(
-            m.total_errors / max(m.total_published + m.total_errors, 1) * 100, 2
-        ),
-    }
+    report = current_report()
 
     ts = int(time.time())
     report_path = RESULTS_DIR / f"load_test_{NODE_ID}_{ts}.json"
