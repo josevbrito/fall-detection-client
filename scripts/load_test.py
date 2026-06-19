@@ -47,7 +47,7 @@ import httpx
 import numpy as np
 import yaml
 from dotenv import load_dotenv
-from prometheus_client import Counter, Gauge, start_http_server
+from prometheus_client import Counter, Gauge, start_http_server, push_to_gateway, REGISTRY
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -83,9 +83,15 @@ TLS_CONTEXT = ssl.create_default_context() if MQTT_TLS else None
 # Quando rodando via Docker, cada container recebe NODE_ID distinto (ex: "node-1").
 NODE_ID = os.getenv("NODE_ID", "local")
 
-# Porta do servidor HTTP do Prometheus (/metrics).
+# Porta do servidor HTTP do Prometheus (/metrics) — modo PULL (só LAN).
 # Cada container usa a mesma porta pois rodam em namespaces de rede isolados.
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8001"))
+
+# Modo PUSH (internet/NAT): se definido, o cliente EMPURRA as métricas para um
+# Pushgateway de endereço fixo (na nuvem) em vez de expor /metrics para o
+# Prometheus raspar. Resolve o problema de o cliente ter IP dinâmico atrás de
+# NAT. Ex: PUSHGATEWAY_URL=https://push.iot.josevbrito.com
+PUSHGATEWAY_URL = os.getenv("PUSHGATEWAY_URL", "").strip()
 
 # QoS MQTT: 0 = fire-and-forget (sem confirmação do broker),
 #           1 = at-least-once (broker envia PUBACK confirmando recebimento).
@@ -470,6 +476,7 @@ async def run_device(
                         METRICS.connected_devices += 1
                     METRICS.active_devices += 1
 
+                    was_falling = False
                     for req_num in range(n_requests):
                         if fall_mode == "session":
                             force_fall = (req_num == fall_at_request)
@@ -478,8 +485,13 @@ async def run_device(
 
                         payload = sensor.read(force_fall=force_fall)
 
-                        if payload["fall_detected"]:
+                        # Conta 1 queda por EPISÓDIO (borda de subida), não por
+                        # mensagem: fall_detected fica True por ~5 leituras
+                        # consecutivas, então contar toda mensagem inflava o total
+                        # em ~5x e não batia com os alarmes do ThingsBoard.
+                        if payload["fall_detected"] and not was_falling:
                             METRICS.total_falls += 1
+                        was_falling = payload["fall_detected"]
 
                         # A medição de latência captura o round-trip completo:
                         #   QoS 0: tempo até o pacote ser entregue ao socket (rápido)
@@ -557,12 +569,32 @@ def build_dashboard() -> Panel:
     )
 
 
+async def _push_to_gateway() -> None:
+    """Empurra o registry atual para o Pushgateway (blocking → roda em thread).
+    grouping_key=node garante uma série por nó, sem colisão entre clientes."""
+    try:
+        await asyncio.to_thread(
+            push_to_gateway,
+            PUSHGATEWAY_URL,
+            job="load_test",
+            registry=REGISTRY,
+            grouping_key={"node": NODE_ID},
+        )
+    except Exception:
+        pass  # monitoramento é best-effort; não derruba o teste
+
+
 async def metrics_loop(refresh_interval: float = 1.0) -> None:
+    tick = 0
     with Live(build_dashboard(), refresh_per_second=1, console=console) as live:
         while METRICS.active_devices > 0 or METRICS.connected_devices == 0:
             await asyncio.sleep(refresh_interval)
             _update_prometheus_metrics()
             live.update(build_dashboard())
+            tick += 1
+            # Em modo push, envia ao Pushgateway a cada ~5s.
+            if PUSHGATEWAY_URL and tick % 5 == 0:
+                await _push_to_gateway()
 
 
 # ---------------------------------------------------------------------------
@@ -606,9 +638,14 @@ async def main(n_devices: int, n_requests: int, interval_ms: int, offset: int = 
     test_duration_s = n_requests * interval_s
     expected_falls = int(len(valid) * fall_prob) if fall_mode == "session" else "variável"
 
-    # Inicia o servidor HTTP do Prometheus em daemon thread (não bloqueia o event loop).
-    # O Prometheus raspa http://<container>:METRICS_PORT/metrics a cada 5s.
-    start_http_server(METRICS_PORT)
+    # Métricas Prometheus:
+    #  - PUSH (internet/NAT): empurra para o Pushgateway fixo na nuvem.
+    #  - PULL (LAN): expõe /metrics na METRICS_PORT para o Prometheus raspar.
+    if PUSHGATEWAY_URL:
+        console.print(f"[cyan]Prometheus: modo PUSH → {PUSHGATEWAY_URL} (job=load_test, node={NODE_ID})[/cyan]")
+    else:
+        start_http_server(METRICS_PORT)
+        console.print(f"[cyan]Prometheus: modo PULL → expondo /metrics na porta {METRICS_PORT}[/cyan]")
 
     console.rule(f"[bold cyan]Iniciando Load Test — nó [{NODE_ID}][/bold cyan]")
     console.print(f"  Nó (NODE_ID):     {NODE_ID}")
